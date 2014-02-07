@@ -1,3 +1,5 @@
+import collections
+import itertools
 import numpy as np
 import cPickle
 import gzip
@@ -27,7 +29,7 @@ class HiddenLayer(object):
             W_values = np.asarray(0.01 * rng.standard_normal(
                 size=(n_in, n_out)), dtype=theano.config.floatX)
             W = theano.shared(value=W_values, name='W')
-        
+
         if b is None:
             b_values = np.zeros((n_out,), dtype=theano.config.floatX)
             b = theano.shared(value=b_values, name='b')
@@ -41,7 +43,7 @@ class HiddenLayer(object):
             lin_output = T.dot(input, self.W)
 
         self.output = (lin_output if activation is None else activation(lin_output))
-    
+
         # parameters of the model
         if use_bias:
             self.params = [self.W, self.b]
@@ -50,12 +52,12 @@ class HiddenLayer(object):
 
 
 def _dropout_from_layer(rng, layer, p):
-    """p is the probablity of dropping a unit
+    """p is the probablity of keeping a unit
     """
     srng = theano.tensor.shared_randomstreams.RandomStreams(
-            rng.randint(999999))
+        rng.randint(999999))
     # p=1-p because 1's indicate keep and p is prob of dropping
-    mask = srng.binomial(n=1, p=1-p, size=layer.shape)
+    mask = srng.binomial(n=1, p=p, size=layer.shape)
     # The cast is important because
     # int * float32 = float64 which pulls things off the gpu
     output = layer * T.cast(mask, theano.config.floatX)
@@ -63,12 +65,12 @@ def _dropout_from_layer(rng, layer, p):
 
 class DropoutHiddenLayer(HiddenLayer):
     def __init__(self, rng, input, n_in, n_out,
-                 activation, use_bias, W=None, b=None):
+                 activation, use_bias, W=None, b=None, p=0.5):
         super(DropoutHiddenLayer, self).__init__(
                 rng=rng, input=input, n_in=n_in, n_out=n_out, W=W, b=b,
                 activation=activation, use_bias=use_bias)
 
-        self.output = _dropout_from_layer(rng, self.output, p=0.5)
+        self.output = _dropout_from_layer(rng, self.output, p=p)
 
 
 class MLP(object):
@@ -76,68 +78,104 @@ class MLP(object):
     training.
 
     """
+
+    def get_dropout_layer(self, n_in, n_out, next_dropout_layer_input, rectified_linear_activation, rng, use_bias,
+                          previous_layer):
+        next_dropout_layer = DropoutHiddenLayer(rng=rng,
+                                                input=next_dropout_layer_input,
+                                                activation=rectified_linear_activation,
+                                                n_in=n_in, n_out=n_out, use_bias=use_bias)
+        return next_dropout_layer
+
+    def get_hidden_layer(self, first_layer, n_in, n_out, next_dropout_layer, next_layer_input,
+                         rectified_linear_activation, rng, use_bias):
+        next_layer = HiddenLayer(rng=rng,
+                                 input=next_layer_input,
+                                 activation=rectified_linear_activation,
+                                 W=next_dropout_layer.W * (0.8 if first_layer else 0.5),
+                                 b=next_dropout_layer.b,
+                                 n_in=n_in, n_out=n_out,
+                                 use_bias=use_bias)
+        return next_layer
+
+    def flatten(self, next_dropout_layer_input, next_layer_input, previous_layer):
+        return next_dropout_layer_input, next_layer_input
+
     def __init__(self,
-            rng,
-            input,
-            layer_sizes,
-            use_bias=True):
-
+                 rng,
+                 input,
+                 layer_sizes,
+                 use_bias=True,
+                 append_log_regression=True,
+                 first_layer=True,
+                 inputMlp=None):
         rectified_linear_activation = lambda x: T.maximum(0.0, x)
-
+        # rectified_linear_activation = lambda x: (T.sgn(x) + 1.0) * x * .5
         # Set up all the hidden layers
         weight_matrix_sizes = zip(layer_sizes, layer_sizes[1:])
         self.layers = []
         self.dropout_layers = []
         next_layer_input = input
-        first_layer = True
+        previous_layer = None
         # dropout the input with prob 0.2
-        next_dropout_layer_input = _dropout_from_layer(rng, input, p=0.2)
+        if first_layer:
+            next_dropout_layer_input = _dropout_from_layer(rng, input, p=0.8)
+        else:
+            next_dropout_layer_input = _dropout_from_layer(rng, input, p=0.5)
+        # add dummy for non-regression outputs
+        if not append_log_regression:
+            weight_matrix_sizes += [()]
         for n_in, n_out in weight_matrix_sizes[:-1]:
-            next_dropout_layer = DropoutHiddenLayer(rng=rng,
-                    input=next_dropout_layer_input,
-                    activation=rectified_linear_activation,
-                    n_in=n_in, n_out=n_out, use_bias=use_bias)
+            next_dropout_layer = self.get_dropout_layer(n_in, n_out, next_dropout_layer_input,
+                                                        rectified_linear_activation, rng, use_bias, previous_layer)
             self.dropout_layers.append(next_dropout_layer)
             next_dropout_layer_input = next_dropout_layer.output
 
             # Reuse the paramters from the dropout layer here, in a different
             # path through the graph.
-            next_layer = HiddenLayer(rng=rng,
-                    input=next_layer_input,
-                    activation=rectified_linear_activation,
-                    W=next_dropout_layer.W * (0.8 if first_layer else 0.5),
-                    b=next_dropout_layer.b,
-                    n_in=n_in, n_out=n_out,
-                    use_bias=use_bias)
+            next_layer = self.get_hidden_layer(first_layer, n_in, n_out, next_dropout_layer, next_layer_input,
+                                               rectified_linear_activation, rng, use_bias)
             self.layers.append(next_layer)
             next_layer_input = next_layer.output
+            previous_layer = next_layer
             first_layer = False
-        
-        # Set up the output layer
-        n_in, n_out = weight_matrix_sizes[-1]
-        dropout_output_layer = LogisticRegression(
+
+        # next_dropout_layer_input, next_layer_input = self.flatten(next_dropout_layer_input, next_layer_input,
+        #                                                               previous_layer)
+
+        if append_log_regression:
+            # Set up the output layer
+            n_in, n_out = weight_matrix_sizes[-1]
+            dropout_output_layer = LogisticRegression(
                 input=next_dropout_layer_input,
                 n_in=n_in, n_out=n_out)
-        self.dropout_layers.append(dropout_output_layer)
+            self.dropout_layers.append(dropout_output_layer)
 
-        # Again, reuse paramters in the dropout output.
-        output_layer = LogisticRegression(
-            input=next_layer_input,
-            W=dropout_output_layer.W * 0.5,
-            b=dropout_output_layer.b,
-            n_in=n_in, n_out=n_out)
-        self.layers.append(output_layer)
+            # Again, reuse paramters in the dropout output.
+            output_layer = LogisticRegression(
+                input=next_layer_input,
+                W=dropout_output_layer.W * 0.5,
+                b=dropout_output_layer.b,
+                n_in=n_in, n_out=n_out)
+            self.layers.append(output_layer)
 
-        # Use the negative log likelihood of the logistic regression layer as
-        # the objective.
-        self.dropout_negative_log_likelihood = self.dropout_layers[-1].negative_log_likelihood
-        self.dropout_errors = self.dropout_layers[-1].errors
+            # Use the negative log likelihood of the logistic regression layer as
+            # the objective.
+            self.dropout_negative_log_likelihood = self.dropout_layers[-1].negative_log_likelihood
+            self.dropout_errors = self.dropout_layers[-1].errors
 
-        self.negative_log_likelihood = self.layers[-1].negative_log_likelihood
-        self.errors = self.layers[-1].errors
-
+            self.negative_log_likelihood = self.layers[-1].negative_log_likelihood
+            self.errors = self.layers[-1].errors
+        self.inputMlp = inputMlp
         # Grab all the parameters together.
-        self.params = [ param for layer in self.dropout_layers for param in layer.params ]
+        if isinstance(inputMlp, collections.Iterable):
+            extparams = [param for mlp in inputMlp for param in mlp.params]
+        else:
+            if isinstance(inputMlp, MLP):
+                extparams = inputMlp.params
+            else:
+                extparams = []
+        self.params = [param for layer in self.dropout_layers for param in layer.params] + extparams
 
 
 def test_mlp(
@@ -161,7 +199,7 @@ def test_mlp(
 
 
     """
-    datasets = load_mnist(dataset)
+    datasets = load_umontreal_data(dataset)
     train_set_x, train_set_y = datasets[0]
     valid_set_x, valid_set_y = datasets[1]
     test_set_x, test_set_y = datasets[2]
@@ -182,15 +220,15 @@ def test_mlp(
     epoch = T.scalar()
     x = T.matrix('x')  # the data is presented as rasterized images
     y = T.ivector('y')  # the labels are presented as 1D vector of
-                        # [int] labels
+    # [int] labels
     learning_rate = theano.shared(np.asarray(initial_learning_rate,
-        dtype=theano.config.floatX))
+                                             dtype=theano.config.floatX))
 
     rng = np.random.RandomState(1234)
 
     # construct the MLP class
     classifier = MLP(rng=rng, input=x,
-           layer_sizes=layer_sizes, use_bias=use_bias)
+                     layer_sizes=layer_sizes, use_bias=use_bias)
 
     # Build the expresson for the cost function.
     cost = classifier.negative_log_likelihood(y)
@@ -198,19 +236,19 @@ def test_mlp(
 
     # Compile theano function for testing.
     test_model = theano.function(inputs=[index],
-            outputs=classifier.errors(y),
-            givens={
-                x: test_set_x[index * batch_size:(index + 1) * batch_size],
-                y: test_set_y[index * batch_size:(index + 1) * batch_size]})
+                                 outputs=classifier.errors(y),
+                                 givens={
+                                     x: test_set_x[index * batch_size:(index + 1) * batch_size],
+                                     y: test_set_y[index * batch_size:(index + 1) * batch_size]})
     #theano.printing.pydotprint(test_model, outfile="test_file.png",
     #        var_with_name_simple=True)
 
     # Compile theano function for validation.
     validate_model = theano.function(inputs=[index],
-            outputs=classifier.errors(y),
-            givens={
-                x: valid_set_x[index * batch_size:(index + 1) * batch_size],
-                y: valid_set_y[index * batch_size:(index + 1) * batch_size]})
+                                     outputs=classifier.errors(y),
+                                     givens={
+                                         x: valid_set_x[index * batch_size:(index + 1) * batch_size],
+                                         y: valid_set_y[index * batch_size:(index + 1) * batch_size]})
     #theano.printing.pydotprint(validate_model, outfile="validate_file.png",
     #        var_with_name_simple=True)
 
@@ -225,13 +263,13 @@ def test_mlp(
     gparams_mom = []
     for param in classifier.params:
         gparam_mom = theano.shared(np.zeros(param.get_value(borrow=True).shape,
-            dtype=theano.config.floatX))
+                                            dtype=theano.config.floatX))
         gparams_mom.append(gparam_mom)
 
     # Compute momentum for the current epoch
     mom = ifelse(epoch < 500,
-            0.5*(1. - epoch/500.) + 0.99*(epoch/500.),
-            0.99)
+                 0.5 * (1. - epoch / 500.) + 0.99 * (epoch / 500.),
+                 0.99)
 
     # Update the step direction using momentum
     updates = {}
@@ -247,7 +285,7 @@ def test_mlp(
         # parameter and constrains it if so... maybe this is a bit silly but it
         # should work for now.
         if param.get_value(borrow=True).ndim == 2:
-            squared_norms = T.sum(stepped_param**2, axis=1).reshape((stepped_param.shape[0],1))
+            squared_norms = T.sum(stepped_param ** 2, axis=1).reshape((stepped_param.shape[0], 1))
             scale = T.clip(T.sqrt(squared_filter_length_limit / squared_norms), 0., 1.)
             updates[param] = stepped_param * scale
         else:
@@ -258,10 +296,10 @@ def test_mlp(
     # updates the model parameters.
     output = dropout_cost if dropout else cost
     train_model = theano.function(inputs=[epoch, index], outputs=output,
-            updates=updates,
-            givens={
-                x: train_set_x[index * batch_size:(index + 1) * batch_size],
-                y: train_set_y[index * batch_size:(index + 1) * batch_size]})
+                                  updates=updates,
+                                  givens={
+                                      x: train_set_x[index * batch_size:(index + 1) * batch_size],
+                                      y: train_set_y[index * batch_size:(index + 1) * batch_size]})
     #theano.printing.pydotprint(train_model, outfile="train_file.png",
     #        var_with_name_simple=True)
 
@@ -269,7 +307,7 @@ def test_mlp(
     # training function because we only want to do this once each epoch instead
     # of after each minibatch.
     decay_learning_rate = theano.function(inputs=[], outputs=learning_rate,
-            updates={learning_rate: learning_rate * learning_rate_decay})
+                                          updates={learning_rate: learning_rate * learning_rate_decay})
 
     ###############
     # TRAIN MODEL #
@@ -297,12 +335,12 @@ def test_mlp(
 
         # Report and save progress.
         print "epoch {}, test error {}, learning_rate={}{}".format(
-                epoch_counter, this_validation_errors,
-                learning_rate.get_value(borrow=True),
-                " **" if this_validation_errors < best_validation_errors else "")
+            epoch_counter, this_validation_errors,
+            learning_rate.get_value(borrow=True),
+            " **" if this_validation_errors < best_validation_errors else "")
 
         best_validation_errors = min(best_validation_errors,
-                this_validation_errors)
+                                     this_validation_errors)
         results_file.write("{0}\n".format(this_validation_errors))
         results_file.flush()
 
@@ -325,9 +363,9 @@ if __name__ == '__main__':
     squared_filter_length_limit = 15.0
     n_epochs = 3000
     batch_size = 100
-    layer_sizes = [ 28*28, 1200, 1200, 10 ]
-    dataset = 'data/mnist_batches.npz'
-    #dataset = 'data/mnist.pkl.gz'
+    layer_sizes = [28 * 28, 1200, 1200, 10]
+    # dataset = '/home/taylor/data/mnist/mnist_batches.npy'
+    dataset = '/home/taylor/git/DeepLearningTutorials/data/mnist.pkl.gz'
 
     if len(sys.argv) < 2:
         print "Usage: {0} [dropout|backprop]".format(sys.argv[0])
