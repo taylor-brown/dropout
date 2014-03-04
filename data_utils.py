@@ -3,12 +3,13 @@ from numpy.linalg import linalg
 import numpy
 import theano
 import theano.tensor as T
+import pandas as pd
 
 valid_end = 17222
 
-test_end = 15500
+test_end = 16500
 
-train_end = 13778
+train_end = 5189
 
 __author__ = 'taylor'
 
@@ -16,6 +17,8 @@ nploc = '/home/taylor/data/random/7.7.4.7.x.npy'
 nplocy = '/home/taylor/data/random/7.7.4.7.y.npy'
 
 
+# testing indicates 10 million points ~= 37 MB, so theano is using c sized float32 (4Byte/item)
+# total size = model + data = 4 * (shape + n_in+ n_hid), but really dominated by shape(rows*cols)
 # get data for flattened shape of n,7,4,7,7
 # i.e. n, time, channel, width, height
 def get_data_raw(shuffle=False):
@@ -23,13 +26,15 @@ def get_data_raw(shuffle=False):
         data_x = numpy.load(nploc)
         data_y = numpy.load(nplocy)
     else:
+        # data = numpy.loadtxt('/home/taylor/data/random/7.7.4.7.july.oct.csv', delimiter=',')
         data = numpy.loadtxt('/home/taylor/data/random/7.7.4.7.july.oct.csv', delimiter=',')
         n = len(data)
         rx = numpy.zeros([n, 7, 4, 7, 7])
         for i in range(n):
             rx[i, :, :, :, :] = reorder(reshape(data[i, :-1]))
         for c in range(4):
-            rx[:, :, c, :, :] = apply_zca(rx[:, :, c, :, :].reshape((n, 7 * 7 * 7))).reshape((n, 7, 7, 7))
+            p, mean = fit_zca(rx[:train_end, :, c, :, :].reshape((train_end, 7 * 7 * 7)))
+            rx[:, :, c, :, :] = apply_zca(rx[:, :, c, :, :].reshape((n, 7 * 7 * 7)), p, mean).reshape((n, 7, 7, 7))
         data_x = numpy.zeros([n, 7 * 4 * 7 * 7])
         for i in range(n):
             data_x[i, :] = rx[i].flatten()
@@ -41,6 +46,45 @@ def get_data_raw(shuffle=False):
         return rxy[:, :-1], rxy[:, -1]
     else:
         return data_x, data_y
+
+
+def get_data_raw_new(shuffle=False):
+    if os.path.isfile(nploc):
+        data_x = numpy.load(nploc)
+        data_y = numpy.load(nplocy)
+    else:
+        data = pd.read_csv('/home/taylor/data/random/conv.drug.csv', delimiter=',',header=None).values
+        data_x = data[:, :-1]
+        data_y = data[:, -1]
+        numpy.save(nploc, data_x)
+        numpy.save(nplocy, data_y)
+    if shuffle:
+        rxy = numpy.random.permutation(numpy.hstack((data_x, data_y.reshape((data_y.shape[0], 1)))))
+        return rxy[:, :-1], rxy[:, -1]
+    else:
+        return data_x, data_y
+
+
+def reshape_data(x, conv2d_size, conv3d_size):
+    prev_index = 0
+    if conv2d_size:
+        c, w, h = conv2d_size
+        x_stat = x[:, prev_index: c * w * h].reshape((x.shape[0], c, w, h))
+        prev_index = c * w * h
+        for idx, chan in enumerate(range(c)):
+            P, mean = fit_zca(x_stat[:, chan, :, :].reshape(x.shape[0], w * h))
+            x_stat[:, chan, :, :] = apply_zca(x_stat[:, chan, :, :].reshape(x.shape[0], w * h), P, mean).reshape(
+                x.shape[0], w, h)
+        x_stat = x_stat.reshape(x.shape[0], c * w * h)
+    if conv3d_size:
+        t, c, w, h = conv3d_size
+        x_dyn = x[:, prev_index:].reshape((x.shape[0], t, c, w, h))
+        for idx, chan in enumerate(range(c)):
+            P, mean = fit_zca(x_dyn[:, :, chan, :, :].reshape(x.shape[0], t * w * h))
+            x_dyn[:, :, chan, :, :] = apply_zca(x_dyn[:, :, chan, :, :].reshape(x.shape[0], t * w * h), P,
+                                                mean).reshape(x.shape[0], t, w, h)
+        x_dyn = x_dyn.reshape(x.shape[0], t * c * w * h)
+    return x_stat, x_dyn
 
 
 def get_shared(input, dtype=theano.config.floatX):
@@ -87,7 +131,7 @@ def get_data_no_time(shuffle=False):
            (test_set_x_stat, test_set_y), data_y
 
 
-def get_data_dyn_split(shuffle=False):
+def get_data_dyn_split_raw(shuffle):
     data_x, data_y = get_data_raw(shuffle)
     static = [0, 1]
     dyn = [2, 3]
@@ -104,6 +148,13 @@ def get_data_dyn_split(shuffle=False):
     for row in range(len(data_x)):
         x_stat[row, :] = x_stat_temp[row, :, :, :].flatten()
         x_dyn[row, :] = x_dyn_temp[row, :, :, :, :].flatten()
+    return data_y, x_dyn, x_stat
+
+
+def get_data_dyn_split(shuffle=False):
+    # data_y, x_dyn, x_stat = get_data_dyn_split_raw(shuffle)
+    data_x, data_y = get_data_raw_new(shuffle)
+    x_stat, x_dyn = reshape_data(data_x, (2,7,7), (7, 2,7,7))
     train_set_x_stat = get_shared(x_stat[0:train_end, :])
     train_set_x_dyn = get_shared(x_dyn[0:train_end, :])
     test_set_x_stat = get_shared(x_stat[train_end:test_end, :])
@@ -156,3 +207,7 @@ def apply_zca(X, P=None, mean_=None):
     return numpy.dot(X - mean_, P)
 
 
+if __name__ == '__main__':
+    data_y, x_dyn, x_stat = get_data_dyn_split_raw(False)
+    d = numpy.hstack((x_stat, x_dyn, data_y.reshape(data_y.shape[0],1)))
+    numpy.savetxt('/tmp/all.csv', d, delimiter=',')

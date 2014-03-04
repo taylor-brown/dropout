@@ -1,3 +1,4 @@
+import PIL.Image
 from collections import OrderedDict
 from sklearn import metrics
 from numpy.linalg import linalg
@@ -8,12 +9,57 @@ import theano.tensor as T
 from convolutional2d_mlp import ConvMLP
 
 from convolutional_mlp import Conv3dMLP
-from data_utils import get_data_dyn_split, test_end, train_end
+from data_utils import get_data_dyn_split, test_end, train_end, get_shared
 from mlp import MLP
 
 import pylab as pl
+from utils import tile_raster_images
 
 __author__ = 'taylor'
+
+
+def get_mlp_paramd(initial_learning_rate,
+                   learning_rate_decay,
+                   squared_filter_length_limit,
+                   n_epochs,
+                   batch_size,
+                   dropout,
+                   nkerns):
+    layer_sizes = ['n', 1000, 1000, 2]
+
+
+    def get_mlp_conv_local(rng, use_bias, x_stat, x_dyn):
+        kerns3d = [7 ** 3 * 2, nkerns]
+        mconv3d = Conv3dMLP(rng, x_dyn, list(kerns3d), batch_size, list(kerns3d), (batch_size, 7, 2, 7, 7),
+                            filter_shape=(kerns3d[-1], 5, 2, 5, 5), append_log_regression=False, first_layer=True)
+        # mlp_3d = MLP(rng=rng, input=mconv3d.layers[-1].output.flatten(2), layer_sizes=[kerns3d[-1] * 3 ** 3, 500],
+        #              use_bias=True, append_log_regression=False, first_layer=False)
+
+        kerns2d = [7 ** 2 * 2, nkerns]
+        mconv2d = ConvMLP(rng, x_stat, list(kerns2d), batch_size, list(kerns2d), (batch_size, 2, 7, 7),
+                          filter_shape=(kerns2d[-1], 2, 5, 5), append_log_regression=False, first_layer=True)
+        # mlp_2d = MLP(rng=rng, input=mconv2d.layers[-1].output.flatten(2), layer_sizes=[kerns2d[-1] * 3 * 3, 500],
+        #              use_bias=True, append_log_regression=False, first_layer=False)
+
+        layer_sizes = [(kerns2d[-1] * 3 * 3) + (kerns3d[-1] * 3 ** 3), 1000, 1000, 2]
+
+        # minput = T.concatenate([mlp_3d.layers[-1].output, mlp_2d.layers[-1].output], axis=1)
+        minput = T.concatenate([mconv2d.layers[-1].output.flatten(2), mconv3d.layers[-1].output.flatten(2)], axis=1)
+        return MLP(rng=rng, input=minput,
+                   layer_sizes=layer_sizes, use_bias=True, first_layer=False, inputMlp=[mconv2d, mconv3d])
+
+
+    print 'running:', initial_learning_rate, learning_rate_decay, \
+        squared_filter_length_limit, n_epochs, batch_size, dropout, nkerns, layer_sizes, 'relu'
+
+    return test_mlp(initial_learning_rate=initial_learning_rate,
+                    learning_rate_decay=learning_rate_decay,
+                    squared_filter_length_limit=squared_filter_length_limit,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    dropout=dropout,
+                    use_bias=True,
+                    get_mlp=get_mlp_conv_local)
 
 
 def test_mlp(
@@ -63,7 +109,7 @@ def test_mlp(
     learning_rate = theano.shared(np.asarray(initial_learning_rate,
                                              dtype=theano.config.floatX))
 
-    rng = np.random.RandomState()
+    rng = np.random.RandomState(12345)
 
     # construct the MLP class
     classifier = get_mlp(rng, use_bias, x_stat, x_dyn)
@@ -141,7 +187,6 @@ def test_mlp(
 
     # Compile theano function for training.  This returns the training cost and
     # updates the model parameters.
-
     train_model = theano.function(inputs=[epoch, index], outputs=output,
                                   updates=updates,
                                   on_unused_input='warn',
@@ -225,47 +270,6 @@ def test_mlp(
            'obtained at iteration %i, with test performance %f %%') %
           (best_validation_errors * 100., best_iter, test_score * 100.))
     return test_score
-
-
-def get_mlp_paramd(initial_learning_rate,
-                   learning_rate_decay,
-                   squared_filter_length_limit,
-                   n_epochs,
-                   batch_size,
-                   dropout,
-                   nkerns):
-    def get_mlp_conv_local(rng, use_bias, x_stat, x_dyn):
-        kerns3d = [7 ** 3 * 2, nkerns]
-        mconv3d = Conv3dMLP(rng, x_dyn, list(kerns3d), batch_size, list(kerns3d), (batch_size, 7, 2, 7, 7),
-                            filter_shape=(kerns3d[-1], 5, 2, 5, 5), append_log_regression=False, first_layer=True)
-        # mlp_3d = MLP(rng=rng, input=mconv3d.layers[-1].output.flatten(2), layer_sizes=[kerns3d[-1] * 3 ** 3, 500],
-        #              use_bias=True, append_log_regression=False, first_layer=False)
-
-        kerns2d = [7 ** 2 * 2, nkerns]
-        mconv2d = ConvMLP(rng, x_stat, list(kerns2d), batch_size, list(kerns2d), (batch_size, 2, 7, 7),
-                          filter_shape=(kerns2d[-1], 2, 5, 5), append_log_regression=False, first_layer=True)
-        # mlp_2d = MLP(rng=rng, input=mconv2d.layers[-1].output.flatten(2), layer_sizes=[kerns2d[-1] * 3 * 3, 500],
-        #              use_bias=True, append_log_regression=False, first_layer=False)
-        layer_sizes = [1000, 1000, 2]
-        layer_sizes = [(kerns2d[-1] * 3 * 3) + (kerns3d[-1] * 3 ** 3), 1000, 2]
-
-        # minput = T.concatenate([mlp_3d.layers[-1].output, mlp_2d.layers[-1].output], axis=1)
-        minput = T.concatenate([mconv2d.layers[-1].output.flatten(2), mconv3d.layers[-1].output.flatten(2)], axis=1)
-        return MLP(rng=rng, input=minput,
-                   layer_sizes=layer_sizes, use_bias=True, first_layer=False, inputMlp=[mconv2d, mconv3d])
-
-
-    print 'running:', initial_learning_rate, learning_rate_decay, \
-        squared_filter_length_limit, n_epochs, batch_size, dropout, nkerns
-
-    return test_mlp(initial_learning_rate=initial_learning_rate,
-                    learning_rate_decay=learning_rate_decay,
-                    squared_filter_length_limit=squared_filter_length_limit,
-                    n_epochs=n_epochs,
-                    batch_size=batch_size,
-                    dropout=dropout,
-                    use_bias=True,
-                    get_mlp=get_mlp_conv_local)
 
 
 if __name__ == '__main__':

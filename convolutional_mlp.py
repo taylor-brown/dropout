@@ -21,6 +21,7 @@ References:
    http://yann.lecun.com/exdb/publis/pdf/lecun-98.pdf
 
 """
+import PIL.Image
 from collections import OrderedDict
 import time
 
@@ -38,6 +39,7 @@ from theano.tensor.signal import downsample
 from mlp import MLP, _dropout_from_layer
 
 from data_utils import get_data, train_end, test_end, valid_end
+from utils import tile_raster_images
 
 
 dtensor5 = TensorType('float32', (False,) * 5)
@@ -362,6 +364,18 @@ def test_mlp(
     decay_learning_rate = theano.function(inputs=[], outputs=learning_rate,
                                           updates={learning_rate: learning_rate * learning_rate_decay})
 
+    if True:
+        for loc, param in enumerate(classifier.params):
+            if param.get_value().shape == (32,5,4,5,5):
+                print 'saving images...'
+                ff = param.get_value()[:,0,0,:,:].reshape((32,25))
+                img = PIL.Image.fromarray(tile_raster_images(ff, (5, 5), (3, 5), tile_spacing=(1, 1)))
+                img.save("ff-before" + str(loc) + ".png")
+                ft = param.get_value()[0, :, 2, :, :].reshape((5, 25))
+                img = PIL.Image.fromarray(tile_raster_images(ft, (5, 5), (1, 5), tile_spacing = (1,1)))
+                img.save("ft-before" + str(loc) + ".png")
+
+
     ###############
     # TRAIN MODEL #
     ###############
@@ -409,6 +423,16 @@ def test_mlp(
         if this_validation_errors < best_validation_errors:
             best_iter = epoch_counter
             best_validation_errors = this_validation_errors
+            if False:
+                for loc, param in enumerate(classifier.params):
+                    if param.get_value().shape == (32, 5, 4, 5, 5):
+                        print 'saving images...'
+                        ff = param.get_value()[:, 0, 0, :, :].reshape((32, 25))
+                        img = PIL.Image.fromarray(tile_raster_images(ff, (5, 5), (3, 5), tile_spacing=(1, 1)))
+                        img.save("ff-after" + str(epoch_counter) + ".png")
+                        ft = param.get_value()[0, :, 2, :, :].reshape((5, 25))
+                        img = PIL.Image.fromarray(tile_raster_images(ft, (5, 5), (1, 5), tile_spacing=(1, 1)))
+                        img.save("ft-after" + str(epoch_counter) + ".png")
 
         # results_file.write("{0}\n".format(this_validation_errors))
         # results_file.flush()
@@ -416,7 +440,6 @@ def test_mlp(
         decay_learning_rate()
         if epoch_counter - best_iter > patience_limit:
             patient = False
-
     end_time = time.clock()
     print(('Optimization complete. Best validation score of %f %% '
            'obtained at iteration %i, with test performance %f %%') %

@@ -1,3 +1,6 @@
+import PIL.Image
+from utils import tile_raster_images
+
 __author__ = 'taylor'
 
 from collections import OrderedDict
@@ -83,7 +86,8 @@ class LeNetConvPool2dLayer(object):
         # reshape it to a tensor of shape (1,n_filters,1,1). Each bias will
         # thus be broadcasted across mini-batches and feature map
         # width & height
-        self.output = T.tanh(pooled_out + self.b.dimshuffle('x', 0, 'x', 'x'))
+        self.output = T.maximum(0.0, pooled_out + self.b.dimshuffle('x', 0, 'x', 'x'))
+        # self.output = T.tanh(pooled_out + self.b.dimshuffle('x', 0, 'x', 'x'))
 
         # store parameters of this layer
         self.params = [self.W, self.b]
@@ -358,6 +362,17 @@ def test_mlp(
         if this_validation_errors < best_validation_errors:
             best_iter = epoch_counter
             best_validation_errors = this_validation_errors
+            if False:
+                for loc, param in enumerate(classifier.params):
+                    if param.get_value().shape == (32, 4, 5, 5):
+                        print 'saving images...'
+                        ff = param.get_value()[:, 0, :, :].reshape((32, 25))
+                        img = PIL.Image.fromarray(tile_raster_images(ff, (5, 5), (3, 5), tile_spacing=(1, 1)))
+                        img.save("ff-after-0-" + str(epoch_counter) + ".png")
+                        ff = param.get_value()[:, 1, :, :].reshape((32, 25))
+                        img = PIL.Image.fromarray(tile_raster_images(ff, (5, 5), (3, 5), tile_spacing=(1, 1)))
+                        img.save("ff-after-1-" + str(epoch_counter) + ".png")
+
 
         # results_file.write("{0}\n".format(this_validation_errors))
         # results_file.flush()
